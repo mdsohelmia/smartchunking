@@ -248,7 +248,7 @@ int main(int argc, char **argv)
         .auto_mode = cfg.force_format ? 0 : 1,
         .force_fmt = cfg.force_format,
         .output_frag = cfg.frag_output};
-    int tr = stitch_chunks(cfg.chunks_dir, &plan, cfg.final_out, &stmode);
+    int tr = stitch_chunks(cfg.final_out, &plan, cfg.chunks_dir, &stmode);
     if (tr != STITCH_OK)
     {
       fprintf(stderr, "stitch_chunks failed: %d\n", tr);
