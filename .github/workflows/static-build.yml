@@ -2,7 +2,7 @@ name: Chunkify Static Build (FFmpeg 8)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
@@ -13,8 +13,8 @@ jobs:
       FFMPEG_PREFIX: /usr/local/ffmpeg-static
 
     steps:
-    - name: Checkout repo
-      uses: actions/checkout@v3
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
     - name: Install dependencies
       run: |
@@ -67,10 +67,10 @@ jobs:
       working-directory: ffmpeg-src
       run: |
         make -j$(nproc)
-        make install
+        sudo make install
 
     # ----------------------------------------------------
-    # Build chunkify_cli static binary
+    # Build Chunkify CLI static binary
     # ----------------------------------------------------
     - name: Build Chunkify Static Binary
       run: |
@@ -84,8 +84,8 @@ jobs:
           $FFMPEG_PREFIX/lib/libswscale.a \
           -lm -lz -lpthread -ldl
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v3
+    - name: Upload chunkify_cli binary
+      uses: actions/upload-artifact@v4
       with:
         name: chunkify_linux_static_ffmpeg8
         path: chunkify_cli
