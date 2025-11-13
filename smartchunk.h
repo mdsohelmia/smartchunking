@@ -20,7 +20,7 @@ extern "C"
   {
     sc_frame_meta *frames;
     int count;
-    int capacity;    // internal use, you can ignore
+    int capacity;    // internal use
     double duration; // seconds
   } sc_probe_result;
 
@@ -35,7 +35,7 @@ extern "C"
   {
     sc_chunk *chunks;
     int count;
-    int capacity; // internal use, you can ignore
+    int capacity; // internal use
   } sc_chunk_plan;
 
   typedef struct

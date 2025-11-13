@@ -17,6 +17,17 @@ static double sc_chunk_dur(const sc_chunk *c)
   return c->end - c->start;
 }
 
+static double pkt_best_effort_ts(const AVPacket *pkt,
+                                 AVRational tb,
+                                 double fallback)
+{
+  if (pkt->pts != AV_NOPTS_VALUE)
+    return pkt->pts * av_q2d(tb);
+  if (pkt->dts != AV_NOPTS_VALUE)
+    return pkt->dts * av_q2d(tb);
+  return fallback;
+}
+
 static int ensure_frame_capacity(sc_probe_result *out, int needed)
 {
   if (needed <= out->capacity)
@@ -100,7 +111,7 @@ int sc_probe_video(const char *filename, sc_probe_result *out)
     out->duration = 0.0;
   }
 
-  AVPacket pkt;
+  AVPacket pkt = {0};
   double last_pts = 0.0;
 
   av_seek_frame(fmt, vstream, 0, AVSEEK_FLAG_BACKWARD);
@@ -109,11 +120,16 @@ int sc_probe_video(const char *filename, sc_probe_result *out)
   {
     if (pkt.stream_index == vstream)
     {
-      double pts = 0.0;
-      if (pkt.pts != AV_NOPTS_VALUE)
-        pts = pkt.pts * av_q2d(tb);
+      double pkt_duration = (pkt.duration > 0)
+                                ? pkt.duration * av_q2d(tb)
+                                : 0.0;
+      double pts = pkt_best_effort_ts(&pkt, tb, last_pts);
+      double endpts = (pkt_duration > 0.0) ? pts + pkt_duration : pts;
 
-      last_pts = pts;
+      if (endpts > last_pts)
+        last_pts = endpts;
+      else if (pts > last_pts)
+        last_pts = pts;
 
       int next_index = out->count + 1;
       int er = ensure_frame_capacity(out, next_index);
@@ -154,7 +170,7 @@ void sc_free_probe(sc_probe_result *res)
 }
 
 // -------------------------------------------------------------
-// Basic planning pass
+// Basic planning pass (keyframe-aware, min/target/max duration)
 // -------------------------------------------------------------
 static int plan_basic(const sc_probe_result *meta,
                       double target,
@@ -170,6 +186,7 @@ static int plan_basic(const sc_probe_result *meta,
   if (!meta || meta->count <= 0 || meta->duration <= 0.0)
     return SC_ERR_INVAL;
 
+  // locate first keyframe
   int first = -1;
   for (int i = 0; i < meta->count; i++)
   {
@@ -182,6 +199,7 @@ static int plan_basic(const sc_probe_result *meta,
 
   if (first < 0)
   {
+    // no keyframe? single chunk
     if (ensure_chunk_capacity(out, 1) != SC_OK)
       return SC_ERR_NOMEM;
     out->chunks[0] = (sc_chunk){.index = 0, .start = 0.0, .end = meta->duration};
@@ -189,24 +207,34 @@ static int plan_basic(const sc_probe_result *meta,
     return SC_OK;
   }
 
-  double start = meta->frames[first].pts_time;
+  double eff_min = (min_dur > 0.0) ? min_dur : target * 0.5;
+  if (eff_min <= 0.0)
+    eff_min = 0.5;
+
+  double eff_target = (target > eff_min) ? target : eff_min;
+  double eff_max = 0.0;
+  if (max_dur > 0.0)
+    eff_max = (max_dur < eff_min) ? eff_min : max_dur;
+
+  double last_cut = 0.0;
   int idx = 0;
 
-  for (int i = first + 1; i < meta->count; i++)
+  for (int i = first; i < meta->count; i++)
   {
     const sc_frame_meta *f = &meta->frames[i];
     if (!f->is_keyframe)
       continue;
 
-    double d = f->pts_time - start;
-    int cut = 0;
+    double candidate = f->pts_time;
+    if (candidate <= last_cut)
+      continue;
 
-    if (d >= target)
-      cut = 1;
-    if (max_dur > 0 && d >= max_dur)
-      cut = 1;
+    double span = candidate - last_cut;
+    int can_cut = span >= eff_min;
+    int want_cut = span >= eff_target;
+    int force_cut = (eff_max > 0.0 && span >= eff_max);
 
-    if (cut)
+    if ((can_cut && want_cut) || force_cut)
     {
       int next_index = out->count + 1;
       int r = ensure_chunk_capacity(out, next_index);
@@ -215,13 +243,14 @@ static int plan_basic(const sc_probe_result *meta,
 
       out->chunks[out->count++] = (sc_chunk){
           .index = idx++,
-          .start = start,
-          .end = f->pts_time};
-      start = f->pts_time;
+          .start = last_cut,
+          .end = candidate};
+      last_cut = candidate;
     }
   }
 
-  if (start < meta->duration)
+  // tail chunk
+  if (last_cut < meta->duration)
   {
     int next_index = out->count + 1;
     int r = ensure_chunk_capacity(out, next_index);
@@ -230,10 +259,11 @@ static int plan_basic(const sc_probe_result *meta,
 
     out->chunks[out->count++] = (sc_chunk){
         .index = idx,
-        .start = start,
+        .start = last_cut,
         .end = meta->duration};
   }
 
+  // avoid very small last chunk
   if (avoid_tiny_last && out->count >= 2)
   {
     sc_chunk *last = &out->chunks[out->count - 1];
@@ -316,6 +346,8 @@ int sc_plan_chunks(const sc_probe_result *meta,
 
   double min_dur = (cfg.min_dur > 0.0) ? cfg.min_dur : target * 0.5;
   double max_dur = (cfg.max_dur > 0.0) ? cfg.max_dur : target * 2.0;
+  if (max_dur > 0.0 && max_dur < min_dur)
+    max_dur = min_dur;
 
   int r = plan_basic(meta, target, min_dur, max_dur,
                      cfg.avoid_tiny_last, out);
@@ -330,7 +362,12 @@ int sc_plan_chunks(const sc_probe_result *meta,
     out->capacity = 0;
 
     double new_target = meta->duration / (double)cfg.min_chunks;
-    r = plan_basic(meta, new_target, min_dur, max_dur,
+    double new_min = (cfg.min_dur > 0.0) ? cfg.min_dur : new_target * 0.5;
+    double new_max = (cfg.max_dur > 0.0) ? cfg.max_dur : new_target * 2.0;
+    if (new_max > 0.0 && new_max < new_min)
+      new_max = new_min;
+
+    r = plan_basic(meta, new_target, new_min, new_max,
                    cfg.avoid_tiny_last, out);
     if (r != SC_OK)
       return r;
