@@ -1,0 +1,91 @@
+name: Chunkify Static Build (FFmpeg 8)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      FFMPEG_PREFIX: /usr/local/ffmpeg-static
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v3
+
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          build-essential \
+          yasm \
+          nasm \
+          pkg-config \
+          libnuma-dev \
+          wget \
+          git \
+          make \
+          zlib1g-dev
+
+    # ----------------------------------------------------
+    # Build FFmpeg 8.0 statically
+    # ----------------------------------------------------
+    - name: Download FFmpeg 8.0
+      run: |
+        mkdir -p $FFMPEG_PREFIX
+        wget https://ffmpeg.org/releases/ffmpeg-8.0.tar.gz
+        tar -xf ffmpeg-8.0.tar.gz
+        mv ffmpeg-8.0 ffmpeg-src
+
+    - name: Configure FFmpeg 8 (static)
+      working-directory: ffmpeg-src
+      run: |
+        ./configure \
+          --prefix=$FFMPEG_PREFIX \
+          --pkg-config-flags="--static" \
+          --extra-cflags="-I$FFMPEG_PREFIX/include" \
+          --extra-ldflags="-L$FFMPEG_PREFIX/lib" \
+          --enable-static \
+          --disable-shared \
+          --disable-doc \
+          --disable-programs \
+          --disable-debug \
+          --disable-avdevice \
+          --enable-avformat \
+          --enable-avcodec \
+          --enable-avfilter \
+          --enable-avutil \
+          --enable-swresample \
+          --enable-swscale \
+          --enable-pthreads \
+          --disable-network
+
+    - name: Build FFmpeg 8.0
+      working-directory: ffmpeg-src
+      run: |
+        make -j$(nproc)
+        make install
+
+    # ----------------------------------------------------
+    # Build chunkify_cli static binary
+    # ----------------------------------------------------
+    - name: Build Chunkify Static Binary
+      run: |
+        gcc -O3 -static -o chunkify_cli \
+          smartchunk.c chunkify_cli.c \
+          $FFMPEG_PREFIX/lib/libavformat.a \
+          $FFMPEG_PREFIX/lib/libavcodec.a \
+          $FFMPEG_PREFIX/lib/libavutil.a \
+          $FFMPEG_PREFIX/lib/libavfilter.a \
+          $FFMPEG_PREFIX/lib/libswresample.a \
+          $FFMPEG_PREFIX/lib/libswscale.a \
+          -lm -lz -lpthread -ldl
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: chunkify_linux_static_ffmpeg8
+        path: chunkify_cli
