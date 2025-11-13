@@ -9,8 +9,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    # FFmpeg install directory inside workspace (safe)
     env:
-      FFMPEG_PREFIX: /usr/local/ffmpeg-static
+      FFMPEG_PREFIX: ${{ github.workspace }}/ffmpeg-static
 
     steps:
     - name: Checkout repository
@@ -30,12 +31,15 @@ jobs:
           make \
           zlib1g-dev
 
+    - name: Prepare directories
+      run: |
+        mkdir -p $FFMPEG_PREFIX
+
     # ----------------------------------------------------
     # Build FFmpeg 8.0 statically
     # ----------------------------------------------------
     - name: Download FFmpeg 8.0
       run: |
-        mkdir -p $FFMPEG_PREFIX
         wget https://ffmpeg.org/releases/ffmpeg-8.0.tar.gz
         tar -xf ffmpeg-8.0.tar.gz
         mv ffmpeg-8.0 ffmpeg-src
@@ -67,10 +71,10 @@ jobs:
       working-directory: ffmpeg-src
       run: |
         make -j$(nproc)
-        sudo make install
+        make install
 
     # ----------------------------------------------------
-    # Build Chunkify CLI static binary
+    # Build chunkify_cli static binary
     # ----------------------------------------------------
     - name: Build Chunkify Static Binary
       run: |
@@ -84,7 +88,7 @@ jobs:
           $FFMPEG_PREFIX/lib/libswscale.a \
           -lm -lz -lpthread -ldl
 
-    - name: Upload chunkify_cli binary
+    - name: Upload chunkify_cli artifact
       uses: actions/upload-artifact@v4
       with:
         name: chunkify_linux_static_ffmpeg8
