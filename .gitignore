@@ -1,0 +1,35 @@
+# Images
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.svg
+*.webp
+*.ico
+
+# Videos
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.wmv
+*.flv
+*.webm
+*.mpeg
+*.mpg
+
+# Audio
+*.mp3
+*.wav
+*.aac
+*.flac
+*.ogg
+*.m4a
+
+.DS_Store
+.vscode
+build
+bin
+chunks.json
