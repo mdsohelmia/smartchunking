@@ -9,7 +9,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
-    # FFmpeg install directory inside workspace (safe)
     env:
       FFMPEG_PREFIX: ${{ github.workspace }}/ffmpeg-static
 
@@ -17,6 +16,9 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    # ----------------------------------------------------
+    # Install build dependencies
+    # ----------------------------------------------------
     - name: Install dependencies
       run: |
         sudo apt update
@@ -25,19 +27,16 @@ jobs:
           yasm \
           nasm \
           pkg-config \
-          libnuma-dev \
           wget \
-          git \
           make \
           zlib1g-dev
 
+    # ----------------------------------------------------
+    # Build FFmpeg 8.0 static
+    # ----------------------------------------------------
     - name: Prepare directories
-      run: |
-        mkdir -p $FFMPEG_PREFIX
+      run: mkdir -p $FFMPEG_PREFIX
 
-    # ----------------------------------------------------
-    # Build FFmpeg 8.0 statically
-    # ----------------------------------------------------
     - name: Download FFmpeg 8.0
       run: |
         wget https://ffmpeg.org/releases/ffmpeg-8.0.tar.gz
@@ -57,6 +56,7 @@ jobs:
           --disable-doc \
           --disable-programs \
           --disable-debug \
+          --disable-network \
           --disable-avdevice \
           --enable-avformat \
           --enable-avcodec \
@@ -65,7 +65,11 @@ jobs:
           --enable-swresample \
           --enable-swscale \
           --enable-pthreads \
-          --disable-network
+          --enable-bsfs \
+          --enable-parsers \
+          --enable-muxers \
+          --enable-demuxers \
+          --enable-protocols
 
     - name: Build FFmpeg 8.0
       working-directory: ffmpeg-src
@@ -73,12 +77,19 @@ jobs:
         make -j$(nproc)
         make install
 
+    # Debug: verify that headers exist
+    - name: Verify FFmpeg includes exist
+      run: |
+        echo "=== FFmpeg include directory ==="
+        ls -R $FFMPEG_PREFIX/include
+
     # ----------------------------------------------------
-    # Build chunkify_cli static binary
+    # Build Chunkify CLI (static)
     # ----------------------------------------------------
     - name: Build Chunkify Static Binary
       run: |
-        gcc -O3 -static -o chunkify_cli \
+        gcc -O3 -static \
+          -I$FFMPEG_PREFIX/include \
           smartchunk.c chunkify_cli.c \
           $FFMPEG_PREFIX/lib/libavformat.a \
           $FFMPEG_PREFIX/lib/libavcodec.a \
@@ -86,9 +97,13 @@ jobs:
           $FFMPEG_PREFIX/lib/libavfilter.a \
           $FFMPEG_PREFIX/lib/libswresample.a \
           $FFMPEG_PREFIX/lib/libswscale.a \
+          -o chunkify_cli \
           -lm -lz -lpthread -ldl
 
-    - name: Upload chunkify_cli artifact
+    # ----------------------------------------------------
+    # Upload static binary
+    # ----------------------------------------------------
+    - name: Upload chunkify_cli binary
       uses: actions/upload-artifact@v4
       with:
         name: chunkify_linux_static_ffmpeg8
