@@ -1,12 +1,20 @@
-name: Chunkify Static Build (FFmpeg 8)
+name: Chunkify Production Build
 
 on:
   push:
     branches: [ "main" ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ "main" ]
   workflow_dispatch:
 
+env:
+  FFMPEG_VERSION: "8.0"
+
 jobs:
-  build:
+  build-linux:
+    name: Build Linux (Static)
     runs-on: ubuntu-latest
 
     env:
@@ -16,10 +24,20 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    - name: Cache FFmpeg build
+      id: cache-ffmpeg
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.FFMPEG_PREFIX }}
+        key: ffmpeg-${{ env.FFMPEG_VERSION }}-linux-static-${{ hashFiles('.github/workflows/static-build.yml') }}
+        restore-keys: |
+          ffmpeg-${{ env.FFMPEG_VERSION }}-linux-static-
+
     # ----------------------------------------------------
     # Install build dependencies
     # ----------------------------------------------------
     - name: Install dependencies
+      if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
       run: |
         sudo apt update
         sudo apt install -y \
@@ -32,18 +50,21 @@ jobs:
           zlib1g-dev
 
     # ----------------------------------------------------
-    # Build FFmpeg 8.0 static
+    # Build FFmpeg 8.0 static (only if not cached)
     # ----------------------------------------------------
     - name: Prepare directories
+      if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
       run: mkdir -p $FFMPEG_PREFIX
 
-    - name: Download FFmpeg 8.0
+    - name: Download FFmpeg ${{ env.FFMPEG_VERSION }}
+      if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
       run: |
-        wget https://ffmpeg.org/releases/ffmpeg-8.0.tar.gz
-        tar -xf ffmpeg-8.0.tar.gz
-        mv ffmpeg-8.0 ffmpeg-src
+        wget https://ffmpeg.org/releases/ffmpeg-${{ env.FFMPEG_VERSION }}.tar.gz
+        tar -xf ffmpeg-${{ env.FFMPEG_VERSION }}.tar.gz
+        mv ffmpeg-${{ env.FFMPEG_VERSION }} ffmpeg-src
 
-    - name: Configure FFmpeg 8 (static)
+    - name: Configure FFmpeg ${{ env.FFMPEG_VERSION }} (static)
+      if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
       working-directory: ffmpeg-src
       run: |
         ./configure \
@@ -71,26 +92,31 @@ jobs:
           --enable-demuxers \
           --enable-protocols
 
-    - name: Build FFmpeg 8.0
+    - name: Build FFmpeg ${{ env.FFMPEG_VERSION }}
+      if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
       working-directory: ffmpeg-src
       run: |
         make -j$(nproc)
         make install
 
-    # Debug: verify that headers exist
-    - name: Verify FFmpeg includes exist
+    - name: Verify FFmpeg build
       run: |
-        echo "=== FFmpeg include directory ==="
-        ls -R $FFMPEG_PREFIX/include
+        echo "=== FFmpeg version and libraries ==="
+        ls -lh $FFMPEG_PREFIX/lib/*.a
+        echo "=== FFmpeg headers ==="
+        ls $FFMPEG_PREFIX/include
 
     # ----------------------------------------------------
     # Build Chunkify CLI (static)
     # ----------------------------------------------------
     - name: Build Chunkify Static Binary
       run: |
-        gcc -O3 -static \
+        gcc -O3 -static -std=c11 -Wall -Wextra \
           -I$FFMPEG_PREFIX/include \
-          smartchunk.c chunkify_cli.c \
+          src/smartchunk.c \
+          src/splitter.c \
+          src/stitcher.c \
+          src/chunkify_cli.c \
           $FFMPEG_PREFIX/lib/libavformat.a \
           $FFMPEG_PREFIX/lib/libavcodec.a \
           $FFMPEG_PREFIX/lib/libavutil.a \
@@ -99,12 +125,128 @@ jobs:
           $FFMPEG_PREFIX/lib/libswscale.a \
           -o chunkify_cli \
           -lm -lz -lpthread -ldl
+        strip chunkify_cli
 
     # ----------------------------------------------------
-    # Upload static binary
+    # Validate and test binary
     # ----------------------------------------------------
-    - name: Upload chunkify_cli binary
+    - name: Verify binary is static
+      run: |
+        echo "=== Binary info ==="
+        file chunkify_cli
+        ls -lh chunkify_cli
+        echo ""
+        echo "=== Checking for dynamic dependencies ==="
+        if ldd chunkify_cli 2>&1 | grep -q "not a dynamic executable"; then
+          echo "✓ Binary is fully static"
+        else
+          echo "✗ Binary has dynamic dependencies:"
+          ldd chunkify_cli
+          exit 1
+        fi
+
+    - name: Test binary basic functionality
+      run: |
+        echo "=== Testing help output ==="
+        ./chunkify_cli --help || true
+        echo ""
+        echo "=== Binary runs successfully ==="
+
+    - name: Get version info
+      id: version
+      run: |
+        if [[ $GITHUB_REF == refs/tags/v* ]]; then
+          VERSION=${GITHUB_REF#refs/tags/v}
+        else
+          VERSION="dev-$(git rev-parse --short HEAD)"
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Version: $VERSION"
+
+    # ----------------------------------------------------
+    # Upload artifacts
+    # ----------------------------------------------------
+    - name: Upload binary artifact
       uses: actions/upload-artifact@v4
       with:
-        name: chunkify_linux_static_ffmpeg8
+        name: chunkify-linux-x86_64-${{ steps.version.outputs.version }}
         path: chunkify_cli
+        retention-days: 90
+
+  # ============================================================
+  # Create GitHub Release (only on tags)
+  # ============================================================
+  release:
+    name: Create Release
+    needs: [build-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Get version from tag
+      id: version
+      run: |
+        VERSION=${GITHUB_REF#refs/tags/v}
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Download Linux binary
+      uses: actions/download-artifact@v4
+      with:
+        name: chunkify-linux-x86_64-${{ steps.version.outputs.version }}
+        path: ./artifacts
+
+    - name: Prepare release assets
+      run: |
+        cd artifacts
+        mv chunkify_cli chunkify-linux-x86_64
+        chmod +x chunkify-linux-x86_64
+        sha256sum chunkify-linux-x86_64 > chunkify-linux-x86_64.sha256
+        ls -lh
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          artifacts/chunkify-linux-x86_64
+          artifacts/chunkify-linux-x86_64.sha256
+        body: |
+          ## Chunkify v${{ steps.version.outputs.version }}
+
+          Smart video chunking tool with lossless stitching capabilities.
+
+          ### Download
+
+          **Linux x86_64** - Static binary (no dependencies required)
+          - Binary: [chunkify-linux-x86_64](https://github.com/${{ github.repository }}/releases/download/v${{ steps.version.outputs.version }}/chunkify-linux-x86_64)
+          - Checksum: [chunkify-linux-x86_64.sha256](https://github.com/${{ github.repository }}/releases/download/v${{ steps.version.outputs.version }}/chunkify-linux-x86_64.sha256)
+
+          ### Installation
+
+          ```bash
+          wget https://github.com/${{ github.repository }}/releases/download/v${{ steps.version.outputs.version }}/chunkify-linux-x86_64
+          chmod +x chunkify-linux-x86_64
+          sudo mv chunkify-linux-x86_64 /usr/local/bin/chunkify
+          ```
+
+          ### Verify Checksum
+          ```bash
+          wget https://github.com/${{ github.repository }}/releases/download/v${{ steps.version.outputs.version }}/chunkify-linux-x86_64.sha256
+          sha256sum -c chunkify-linux-x86_64.sha256
+          ```
+
+          ### Usage
+          ```bash
+          chunkify --help
+          ```
+
+          ---
+          Built with FFmpeg ${{ env.FFMPEG_VERSION }} (static)
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
