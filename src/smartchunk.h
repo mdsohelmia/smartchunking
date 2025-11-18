@@ -2,6 +2,7 @@
 #define SMARTCHUNK_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C"
@@ -13,8 +14,12 @@ extern "C"
   // ---------------------------------------------
   typedef struct
   {
-    double pts_time; // best-effort timestamp (sec)
-    int is_keyframe; // safe cut point
+    double pts_time;    // best-effort timestamp (sec)
+    int is_keyframe;    // safe cut point
+    int64_t pkt_size;   // packet size (bytes) - proxy for complexity
+    int pict_type;      // frame type: I=1, P=2, B=3, unknown=0
+    double complexity;  // computed complexity score (0.0-1.0)
+    int is_scene_cut;   // detected scene change
   } sc_frame_meta;
 
   // ---------------------------------------------
@@ -36,6 +41,10 @@ extern "C"
     int index;
     double start;
     double end;
+    double avg_complexity;  // average complexity of this chunk
+    int keyframe_count;     // number of keyframes in chunk
+    int scene_cut_count;    // number of scene changes in chunk
+    double quality_score;   // overall quality score for this chunk
   } sc_chunk;
 
   // ---------------------------------------------
@@ -62,6 +71,14 @@ extern "C"
     int max_chunks;
 
     int ideal_parallel; // override target_dur
+
+    // Smart chunking options
+    int enable_scene_detection;   // use scene changes for cut points
+    int enable_complexity_adapt;  // adapt chunk sizes based on complexity
+    int enable_gop_analysis;      // prefer closed GOP boundaries
+    int enable_balanced_dist;     // optimize distribution across all chunks
+    double scene_threshold;       // scene detection sensitivity (0.0-1.0)
+    double complexity_weight;     // how much to weight complexity (0.0-1.0)
   } sc_plan_config;
 
 // ---------------------------------------------

@@ -13,9 +13,10 @@
 typedef struct
 {
   int out_index;
-  int64_t offset;   /* accumulated PTS offset in input time_base units */
-  int64_t last_pts; /* last rebased pts in input time_base */
-  int64_t last_dts; /* last rebased dts in input time_base */
+  int64_t offset;       /* accumulated PTS offset in input time_base units */
+  int64_t last_pts;     /* last rebased pts in input time_base */
+  int64_t last_dts;     /* last rebased dts in input time_base */
+  int64_t last_duration; /* last packet duration */
   AVRational time_base;
   enum AVMediaType type;
 } stitch_stream_state;
@@ -92,6 +93,10 @@ int stitch_chunks(const char *output_path,
     av_dict_set(&mux_opts, "movflags", "frag_keyframe+empty_moov+omit_tfhd_offset", 0);
   if (cfg->enable_faststart && !cfg->output_frag && !strcmp(fmt_name, "mp4"))
     av_dict_set(&mux_opts, "movflags", "faststart", 0);
+
+  // For bit-perfect reconstruction, disable automatic timestamp shifting
+  // This preserves negative DTS values from the source
+  av_dict_set(&mux_opts, "avoid_negative_ts", "disabled", 0);
 
   AVPacket *pkt = av_packet_alloc();
   if (!pkt)
@@ -177,13 +182,25 @@ int stitch_chunks(const char *output_path,
           rc = STITCH_ERR_STREAM;
           break;
         }
-        ost->codecpar->codec_tag = 0;
+        // Preserve codec tag to ensure exact stream copy
+        // Set to 0 only if output format requires it
+        if (out_ctx->oformat->flags & AVFMT_NOTIMESTAMPS)
+          ost->codecpar->codec_tag = 0;
+
+        // Copy all stream metadata for lossless transfer
         ost->time_base = ist->time_base;
+        ost->avg_frame_rate = ist->avg_frame_rate;
+        ost->r_frame_rate = ist->r_frame_rate;
+        ost->sample_aspect_ratio = ist->sample_aspect_ratio;
+
+        // Copy side data
+        av_dict_copy(&ost->metadata, ist->metadata, 0);
 
         streams[st_idx].out_index = ost->index;
         streams[st_idx].offset = 0;
         streams[st_idx].last_pts = AV_NOPTS_VALUE;
         streams[st_idx].last_dts = AV_NOPTS_VALUE;
+        streams[st_idx].last_duration = 0;
         streams[st_idx].time_base = ist->time_base;
         streams[st_idx].type = ist->codecpar->codec_type;
         st_idx++;
@@ -232,6 +249,25 @@ int stitch_chunks(const char *output_path,
       }
     }
 
+    // Track the maximum timestamp for each stream before processing packets
+    int64_t *max_pts_in_chunk = calloc(chunk_streams, sizeof(int64_t));
+    int64_t *max_dts_in_chunk = calloc(chunk_streams, sizeof(int64_t));
+    if (!max_pts_in_chunk || !max_dts_in_chunk)
+    {
+      free(max_pts_in_chunk);
+      free(max_dts_in_chunk);
+      free(chunk_map);
+      free(first_pts);
+      avformat_close_input(&in_ctx);
+      rc = STITCH_ERR_NOMEM;
+      break;
+    }
+    for (int i = 0; i < chunk_streams; i++)
+    {
+      max_pts_in_chunk[i] = AV_NOPTS_VALUE;
+      max_dts_in_chunk[i] = AV_NOPTS_VALUE;
+    }
+
     while (av_read_frame(in_ctx, pkt) >= 0)
     {
       int state_idx = chunk_map[pkt->stream_index];
@@ -252,46 +288,57 @@ int stitch_chunks(const char *output_path,
         break;
       }
 
-      int64_t base = first_pts[pkt->stream_index];
-      if (base == AV_NOPTS_VALUE)
-      {
-        base = resolve_first_ts(pkt);
-        first_pts[pkt->stream_index] = base;
-      }
-
+      // For the first chunk (ci == 0), preserve exact timestamps
+      // For subsequent chunks, we need to offset them
       int64_t rebased_pts = AV_NOPTS_VALUE;
       int64_t rebased_dts = AV_NOPTS_VALUE;
 
-      if (pkt->pts != AV_NOPTS_VALUE)
+      if (ci == 0)
       {
-        rebased_pts = pkt->pts - base + state->offset;
-        pkt->pts = rebased_pts;
+        // First chunk: keep original timestamps exactly as they are
+        // No modification needed - just track for offset calculation
+        rebased_pts = pkt->pts;
+        rebased_dts = pkt->dts;
       }
-      if (pkt->dts != AV_NOPTS_VALUE)
+      else
       {
-        rebased_dts = pkt->dts - base + state->offset;
-        pkt->dts = rebased_dts;
+        // Track first timestamp of this chunk to calculate offset
+        int64_t base = first_pts[pkt->stream_index];
+        if (base == AV_NOPTS_VALUE)
+        {
+          base = resolve_first_ts(pkt);
+          first_pts[pkt->stream_index] = base;
+        }
+
+        // Remove chunk's base timestamp and add accumulated offset
+        if (pkt->pts != AV_NOPTS_VALUE)
+        {
+          rebased_pts = (pkt->pts - base) + state->offset;
+          pkt->pts = rebased_pts;
+        }
+        if (pkt->dts != AV_NOPTS_VALUE)
+        {
+          rebased_dts = (pkt->dts - base) + state->offset;
+          pkt->dts = rebased_dts;
+        }
       }
 
-      if (pkt->pts == AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE)
+      // Track max timestamps in input timebase before rescaling
+      if (rebased_pts != AV_NOPTS_VALUE &&
+          (max_pts_in_chunk[pkt->stream_index] == AV_NOPTS_VALUE ||
+           rebased_pts > max_pts_in_chunk[pkt->stream_index]))
       {
-        pkt->pts = pkt->dts;
-        rebased_pts = rebased_dts;
+        max_pts_in_chunk[pkt->stream_index] = rebased_pts;
       }
-      if (pkt->dts == AV_NOPTS_VALUE && pkt->pts != AV_NOPTS_VALUE)
+      if (rebased_dts != AV_NOPTS_VALUE &&
+          (max_dts_in_chunk[pkt->stream_index] == AV_NOPTS_VALUE ||
+           rebased_dts > max_dts_in_chunk[pkt->stream_index]))
       {
-        pkt->dts = pkt->pts;
-        rebased_dts = rebased_pts;
-      }
-      if (pkt->pts != AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE &&
-          pkt->dts > pkt->pts)
-      {
-        pkt->pts = pkt->dts;
-        rebased_pts = rebased_dts;
+        max_dts_in_chunk[pkt->stream_index] = rebased_dts;
       }
 
+      // Now rescale to output time base
       av_packet_rescale_ts(pkt, ist->time_base, ost->time_base);
-      pkt->duration = av_rescale_q(pkt->duration, ist->time_base, ost->time_base);
       pkt->stream_index = state->out_index;
       pkt->pos = -1;
 
@@ -302,6 +349,7 @@ int stitch_chunks(const char *output_path,
         break;
       }
 
+      // Store last values in INPUT timebase for offset calculation
       if (rebased_pts != AV_NOPTS_VALUE)
         state->last_pts = rebased_pts;
       if (rebased_dts != AV_NOPTS_VALUE)
@@ -310,14 +358,43 @@ int stitch_chunks(const char *output_path,
       av_packet_unref(pkt);
     }
 
+    // Update offset for next chunk based on the maximum timestamp in this chunk
+    // Use input timebase for offset calculation to avoid rounding errors
     for (int s = 0; s < stream_count; s++)
     {
-      int64_t tail = streams[s].last_pts;
+      // Find the corresponding input stream index
+      int input_idx = -1;
+      for (int i = 0; i < chunk_streams; i++)
+      {
+        if (chunk_map[i] == s)
+        {
+          input_idx = i;
+          break;
+        }
+      }
+
+      if (input_idx < 0)
+        continue;
+
+      int64_t tail = max_pts_in_chunk[input_idx];
       if (tail == AV_NOPTS_VALUE)
-        tail = streams[s].last_dts;
+        tail = max_dts_in_chunk[input_idx];
+
       if (tail != AV_NOPTS_VALUE)
-        streams[s].offset = tail + 1;
+      {
+        // Calculate the duration of the last packet
+        AVStream *ist = in_ctx->streams[input_idx];
+        int64_t duration = ist->avg_frame_rate.num > 0
+            ? av_rescale_q(1, av_inv_q(ist->avg_frame_rate), ist->time_base)
+            : 1;
+
+        // Next chunk offset = max timestamp + one frame duration
+        streams[s].offset = tail + duration;
+      }
     }
+
+    free(max_pts_in_chunk);
+    free(max_dts_in_chunk);
 
     free(chunk_map);
     free(first_pts);

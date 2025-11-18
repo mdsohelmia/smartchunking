@@ -26,6 +26,14 @@ typedef struct
   const char *force_format;
   int skip_split;
   int skip_stitch;
+
+  // Smart chunking options
+  int enable_smart;
+  int enable_scene_detection;
+  int enable_complexity;
+  double scene_threshold;
+  double complexity_weight;
+  int verbose;
 } cli_config;
 
 static void cli_defaults(cli_config *cfg)
@@ -33,6 +41,8 @@ static void cli_defaults(cli_config *cfg)
   memset(cfg, 0, sizeof(*cfg));
   cfg->target = 60.0;
   cfg->avoid_tiny_last = 1;
+  cfg->scene_threshold = 0.35;
+  cfg->complexity_weight = 0.3;
 }
 
 static void print_usage(const char *prog)
@@ -40,7 +50,7 @@ static void print_usage(const char *prog)
   fprintf(stderr,
           "Usage: %s [options] <input> <chunks_dir> [final_output]\n"
           "\n"
-          "Options:\n"
+          "Basic Options:\n"
           "  --target <sec>         Target chunk duration (default 60)\n"
           "  --min <sec>            Minimum chunk duration\n"
           "  --max <sec>            Maximum chunk duration\n"
@@ -52,7 +62,15 @@ static void print_usage(const char *prog)
           "  --no-stitch            Skip stitching\n"
           "  --frag                 Enable fragmented MP4 outputs\n"
           "  --force-format <fmt>   Force muxer (mp4/mov/matroska/...)\n"
-          "  --plan-json <path>     Write plan as JSON array\n",
+          "  --plan-json <path>     Write plan as JSON array\n"
+          "\n"
+          "Smart Chunking Options:\n"
+          "  --smart                Enable all smart chunking features\n"
+          "  --scene-detect         Enable scene change detection\n"
+          "  --complexity           Enable complexity-based adaptation\n"
+          "  --scene-threshold <n>  Scene detection sensitivity 0.0-1.0 (default 0.35)\n"
+          "  --complexity-weight <n> Complexity weighting 0.0-1.0 (default 0.3)\n"
+          "  --verbose              Show detailed chunk quality metrics\n",
           prog);
 }
 
@@ -111,6 +129,32 @@ static int parse_args(int argc, char **argv, cli_config *cfg)
     {
       cfg->skip_stitch = 1;
     }
+    else if (!strcmp(arg, "--smart"))
+    {
+      cfg->enable_smart = 1;
+      cfg->enable_scene_detection = 1;
+      cfg->enable_complexity = 1;
+    }
+    else if (!strcmp(arg, "--scene-detect"))
+    {
+      cfg->enable_scene_detection = 1;
+    }
+    else if (!strcmp(arg, "--complexity"))
+    {
+      cfg->enable_complexity = 1;
+    }
+    else if (!strcmp(arg, "--scene-threshold") && i + 1 < argc)
+    {
+      cfg->scene_threshold = atof(argv[++i]);
+    }
+    else if (!strcmp(arg, "--complexity-weight") && i + 1 < argc)
+    {
+      cfg->complexity_weight = atof(argv[++i]);
+    }
+    else if (!strcmp(arg, "--verbose"))
+    {
+      cfg->verbose = 1;
+    }
     else if (arg[0] == '-')
     {
       fprintf(stderr, "Unknown option: %s\n", arg);
@@ -147,14 +191,44 @@ static int parse_args(int argc, char **argv, cli_config *cfg)
   return 0;
 }
 
-static void dump_plan(const sc_chunk_plan *plan)
+static void dump_plan(const sc_chunk_plan *plan, int verbose)
 {
   fprintf(stdout, "Chunk plan (%d chunks):\n", plan->count);
+
+  double total_complexity = 0.0;
+  int total_keyframes = 0;
+  int total_scene_cuts = 0;
+
   for (int i = 0; i < plan->count; i++)
   {
     const sc_chunk *c = &plan->chunks[i];
-    fprintf(stdout, "  #%03d  %.3f -> %.3f  (%.3f s)\n",
-            c->index, c->start, c->end, c->end - c->start);
+    double duration = c->end - c->start;
+
+    if (verbose)
+    {
+      fprintf(stdout, "  #%03d  %.3f -> %.3f  (%.3f s)  ",
+              c->index, c->start, c->end, duration);
+      fprintf(stdout, "complexity=%.2f  keyframes=%d  scenes=%d  quality=%.2f\n",
+              c->avg_complexity, c->keyframe_count, c->scene_cut_count, c->quality_score);
+
+      total_complexity += c->avg_complexity;
+      total_keyframes += c->keyframe_count;
+      total_scene_cuts += c->scene_cut_count;
+    }
+    else
+    {
+      fprintf(stdout, "  #%03d  %.3f -> %.3f  (%.3f s)\n",
+              c->index, c->start, c->end, duration);
+    }
+  }
+
+  if (verbose && plan->count > 0)
+  {
+    fprintf(stdout, "\nQuality Summary:\n");
+    fprintf(stdout, "  Avg complexity: %.2f\n", total_complexity / plan->count);
+    fprintf(stdout, "  Total keyframes: %d\n", total_keyframes);
+    fprintf(stdout, "  Total scene cuts: %d\n", total_scene_cuts);
+    fprintf(stdout, "  Avg keyframes/chunk: %.1f\n", (double)total_keyframes / plan->count);
   }
 }
 
@@ -211,7 +285,19 @@ int main(int argc, char **argv)
       .avoid_tiny_last = cfg.avoid_tiny_last,
       .min_chunks = cfg.min_chunks,
       .max_chunks = cfg.max_chunks,
-      .ideal_parallel = cfg.ideal_parallel};
+      .ideal_parallel = cfg.ideal_parallel,
+      .enable_scene_detection = cfg.enable_scene_detection,
+      .enable_complexity_adapt = cfg.enable_complexity,
+      .enable_gop_analysis = 0,
+      .enable_balanced_dist = 0,
+      .scene_threshold = cfg.scene_threshold,
+      .complexity_weight = cfg.complexity_weight};
+
+  if (cfg.enable_smart || cfg.enable_scene_detection || cfg.enable_complexity)
+  {
+    fprintf(stdout, "Smart Chunking enabled (scene_detect=%d, complexity=%d)\n",
+            cfg.enable_scene_detection, cfg.enable_complexity);
+  }
 
   if (sc_plan_chunks(&probe, pcfg, &plan) != SC_OK)
   {
@@ -220,7 +306,7 @@ int main(int argc, char **argv)
     return 3;
   }
 
-  dump_plan(&plan);
+  dump_plan(&plan, cfg.verbose);
 
   if (cfg.plan_json)
     write_plan_json(cfg.plan_json, &plan);
